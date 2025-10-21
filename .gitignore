@@ -205,3 +205,15 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Project specific files
+*Zone.Identifier
+*.avi
+yolo_models/**
+train/**
+validation/**
+test/**
+!yolo_models/.gitkeep
+!train/.gitkeep
+!validation/.gitkeep
+!test/.gitkeep
