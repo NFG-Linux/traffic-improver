@@ -9,3 +9,5 @@ There is a .avi file in each c0xx folder (not in github repo due to size) Obtain
 http://www.aicitychallenge.org/2022-track1-download/
 
 if you're reading this, the github repo was most likely cloned... if not, CLONE THE GITHUB REPO 1ST! then download the zip file and copy the contents held in the train validation and test folders into the corresponding gitrepo folders
+
+The yolo_models directory should have the yolov8 model weight files; obtained from coursework (not included in repo)
