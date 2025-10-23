@@ -1,12 +1,84 @@
-import cv2 
+import os, re, glob, cv2, math, csv
 import numpy as np
-import math
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import List, Tuple, Dict, Optional
 from ultralytics import YOLO
 
-model_dir = "../yolo_models"
-model_type = "l"
+###END IMPORTS
 
+model_dir = "./yolo_models"
+model_type = "l"
 model = YOLO(f"{model_dir}/yolov8{model_type}.pt")
+conf_val = 0.35
+imgsz_val = 960
+iou_val = 0.45
+out_dir = "./for_eval"
+prediction_file = "prediction.txt"
+thresh = 0.7
+_CAM_RE = re.compile(r"(?:^|[\\/])c(\d{3})(?:[\\/]|$)", re.IGNORECASE)
+
+###END GLOBAL VARIABLES
+
+def xywh(a: Tuple[int,int,int,int], b: Tuple[int,int,int,int]) -> float:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ax2, ay2 = ax + aw, ay + ah
+    bx2, by2 = bx + bw, by + bh
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    ua = aw * ah + bw * bh - inter
+    return inter / (ua + 1e-9)
+
+#cosine_sim
+def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    if a is None or b is None:
+        return -1.0
+    na = np.linalg.norm(a)
+    nb = np.linalg.norm(b)
+    if na == 0 or nb == 0:
+        return -1.0
+    return float(np.dot(a, b) / (na * nb))
+
+#cam list
+def cam_list(cam_list_file: str):
+    cams = []
+    with open(cam_list_file, "r") as f:
+        lines = [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
+        
+    for cam_dir in lines:
+        cam_dir = os.path.normpath(cam_dir)
+        #cam_dir = os.path.abspath(cam_dir)
+        
+        cam = _CAM_RE.search(cam_dir)
+        cam_id = int(cam.group(1))
+        
+        vid_path = os.path.join(cam_dir, "vdo.avi")
+        roi_path = os.path.join(cam_dir, "roi.jpg")
+        gt_path = os.path.join(cam_dir, "gt", "gt.txt")
+        det_dir = os.path.join(cam_dir, "det")
+        mtmc_dir = os.path.join(cam_dir, "mtsc")
+        segm_dir = os.path.join(cam_dir, "segm")
+        
+        meta = {
+            "roi": roi_path,
+            "gt": gt_path,
+            "det_dir": det_dir,
+            "mtmc_dir": mtmc_dir,
+            "segm_dir": segm_dir,
+        }
+
+        cams.append((cam_id, "video", vid_path, meta))
+
+    return cams
+
+###END FUNCTIONS
+
+###ORIG CODE BELOW
 
 name = model.names
 
@@ -26,7 +98,7 @@ count = 0
 center_points_prev_frame = []
 tracking_objects = {}
 track_id = 0
-max_miss = 10
+max_miss = 15
 misses = {}
 
 while True:
