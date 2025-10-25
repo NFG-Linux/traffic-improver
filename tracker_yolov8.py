@@ -13,12 +13,126 @@ model = YOLO(f"{model_dir}/yolov8{model_type}.pt")
 conf_val = 0.35
 imgsz_val = 960
 iou_val = 0.45
-out_dir = "./for_eval"
+cur_dir = os.getcwd()
+out_dir = "for_eval"
 prediction_file = "prediction.txt"
+cam_list_file = "list_cam.txt"
 thresh = 0.7
+max_miss = 15
 _CAM_RE = re.compile(r"(?:^|[\\/])c(\d{3})(?:[\\/]|$)", re.IGNORECASE)
 
 ###END GLOBAL VARIABLES
+
+@dataclass
+class Track:
+    tid: int
+    box: Tuple[int,int,int,int]
+    score: float
+    cls: int
+    last_frame: int
+    misses: int = 0
+    frames: List[int] = field(default_factory=list)
+    boxes: List[Tuple[int,int,int,int]] = field(default_factory=list)
+    emb: Optional[np.ndarray] = None
+    
+    def update(self, frame1: int, box: Tuple[int,int,int,int], score: float, cls: int, patch: Optional[np.ndarray], alpha: float = 0.3):
+        self.box = box
+        self.score = score
+        self.cls = cls
+        self.last_frame = frame1
+        self.misses = 0
+        self.frames.append(frame1)
+        self.boxes.append(box)
+        if patch is not None:
+            feat = embed_hsv(patch)
+            if feat is not None:
+                if self.emb is None:
+                    self.emb = feat
+                else:
+                    self.emb = (1 - alpha) * self.emb + alpha * feat
+                    
+@dataclass
+class Detections:
+    cam_id: int
+    local_id: int
+    frames: List[int]
+    boxes: List[Tuple[int,int,int,int]]
+    emb: Optional[np.ndarray]
+    
+    @property
+    def start(self) -> int:
+        return self.frames[0] if self.frames else 1
+    
+    @property
+    def end(self) -> int:
+        return self.frames[-1] if self.frames else 1
+    
+    def center_end(self) -> Tuple[float,float]:
+        if not self.boxes:
+            return (0.0, 0.0)
+        x,y,w,h = self.boxes[-1]
+        return (x + w/2, y + h/2)
+    
+class TrackIoU:
+    def __init__(self, iou_thresh: float, max_miss: int):
+        self.iou_thresh = iou_thresh
+        self.max_miss = max_miss
+        self.next_id = 1
+        self.tracks: Dict[int, Track] = {}
+        
+    def step(self, frame1: int, frame_img: np.ndarray, dets: List[Tuple[Tuple[int,int,int,int], float, int]]) -> Dict[int, Track]:
+        notmatched = set(self.tracks.keys())
+        matches = []
+        sort_dets = sorted(dets, key=lambda d: d[1], reverse=True)
+        
+        for di, (dbox, dscore, dcls) in enumerate(sort_dets):
+            best_tid = None
+            best_iou = self.iou_thresh
+            for tid in list(notmatched):
+                iou = xywh(self.tracks[tid].box, dbox)
+                if iou >= best_iou:
+                    best_iou = iou
+                    best_tid = tid
+            if best_tid is not None:
+                matches.append((best_tid, di))
+                notmatched.discard(best_tid)
+                    
+        for tid, di in matches:
+            dbox, dscore, dcls = sort_dets[di]
+            patch = crop(frame_img, dbox)
+            self.tracks[tid].update(frame1, dbox, dscore, dcls, patch)
+            
+        assigned_di = {di for _, di in matches}
+        for di, (dbox, dscore, dcls) in enumerate(sort_dets):
+            if di in assigned_di:
+                continue
+            tid = self.next_id
+            self.next_id += 1
+            patch = crop(frame_img, dbox)
+            tr = Track(tid=tid, box=dbox, score=dscore, cls=dcls, last_frame=frame1)
+            tr.update(frame1, dbox, dscore, dcls, patch)
+            self.tracks[tid] = tr
+            
+        del_list = []
+        for tid in list(notmatched):
+            tr = self.tracks[tid]
+            tr.misses += 1
+            if tr.misses > self.max_miss:
+                del_list.append(tid)
+        for tid in del_list:
+            del self.tracks[tid]
+            
+        return self.tracks
+    
+@dataclass
+class Result:
+    detections: Dict[int, 'Detections']
+    width: int
+    height: int
+    fps: float
+
+
+###END CLASSES
 
 def xywh(a: Tuple[int,int,int,int], b: Tuple[int,int,int,int]) -> float:
     ax, ay, aw, ah = a
@@ -34,8 +148,7 @@ def xywh(a: Tuple[int,int,int,int], b: Tuple[int,int,int,int]) -> float:
     ua = aw * ah + bw * bh - inter
     return inter / (ua + 1e-9)
 
-#cosine_sim
-def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+def cosine_sim(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> float:
     if a is None or b is None:
         return -1.0
     na = np.linalg.norm(a)
@@ -43,6 +156,13 @@ def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     if na == 0 or nb == 0:
         return -1.0
     return float(np.dot(a, b) / (na * nb))
+
+def box_frame_bind(x:int, y:int, w:int, h:int, W:int, H:int) -> Tuple[int,int,int,int]:
+    x = max(0, min(x, W - 1))
+    y = max(0, min(y, H - 1))
+    w = max(1, min(w, W - x))
+    h = max(1, min(h, H - y))
+    return x, y, w, h
 
 #cam list
 def cam_list(cam_list_file: str):
@@ -62,130 +182,178 @@ def cam_list(cam_list_file: str):
         gt_path = os.path.join(cam_dir, "gt", "gt.txt")
         det_dir = os.path.join(cam_dir, "det")
         mtmc_dir = os.path.join(cam_dir, "mtsc")
-        segm_dir = os.path.join(cam_dir, "segm")
+        segm_dir = os.path.join(cam_dir, "segm", "segm_mask_rcnn.txt")
+        calibrate_dir = os.path.join(cam_dir, "calibration.txt")
         
         meta = {
+            "cam_dir": cam_dir,
             "roi": roi_path,
             "gt": gt_path,
             "det_dir": det_dir,
             "mtmc_dir": mtmc_dir,
             "segm_dir": segm_dir,
+            "calibration": calibrate_dir
         }
 
-        cams.append((cam_id, "video", vid_path, meta))
+        cams.append((cam_id, vid_path, meta))
 
     return cams
 
+def crop(frame: np.ndarray, box: Tuple[int,int,int,int]) -> np.ndarray:
+    h, w = frame.shape[:2]
+    x, y, bw, bh = box
+    x2, y2 = x + bw, y + bh
+    x, y = max(0, x), max(0, y)
+    x2, y2 = min(w, x2), min(h, y2)
+    if x2 <= x or y2 <= y:
+        return None
+    return frame[y:y2, x:x2]
+
+def embed_hsv(img: np.ndarray) -> Optional[np.ndarray]:
+    if img is None or img.size == 0:
+        return None
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    h_bins, s_bins, v_bins = 16, 16, 8
+    vect = cv2.calcHist([hsv], [0,1,2], None, [h_bins, s_bins, v_bins], [0,180, 0,256, 0,256])
+    vect = cv2.normalize(vect, None).flatten().astype(np.float32)
+    return vect
+
+def camera(cam_id: int, vid_path: str, model: YOLO, conf: float, imgsz: int, iou_val: float, max_miss: int, draw: bool,
+           draw_path: Optional[str]) -> Result:
+    cap = cv2.VideoCapture(vid_path)
+    
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    
+    writer = None
+    if draw and draw_path:
+        writer = cv2.VideoWriter(draw_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (W, H))
+        
+    tracker = TrackIoU(iou_thresh=iou_val, max_miss=max_miss)
+    
+    frame0 = -1
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame0 += 1
+        frame1 = frame0 + 1
+        
+        yolo = model(frame, conf=conf, imgsz=imgsz)[0]
+        data = yolo.boxes.data.cpu().numpy() if yolo.boxes is not None else np.empty((0,6), dtype=np.float32)
+        
+        dets: List[Tuple[Tuple[int,int,int,int], float, int]] = []
+        if data.size > 0:
+            xyxy = data[:, :4].astype(int)
+            scores = data[:, 4]
+            cls_ids = data[:, 5].astype(int)
+            for (x1, y1, x2, y2), sc, cid in zip(xyxy, scores, cls_ids):
+                x = int(x1); y = int(y1); w = int(x2 - x1); h = int(y2 - y1)
+                x, y, w, h = box_frame_bind(x, y, w, h, W, H)
+                dets.append(((x, y, w, h), float(sc), int(cid)))
+                
+        tracks = tracker.step(frame1, frame, dets)
+        
+        if writer is not None:
+            for tid, tr in tracks.items():
+                if tr.last_frame != frame1:
+                    continue
+                x,y,w,h = tr.box
+                cv2.rectangle(frame, (x,y), (x+w, y+h), (0,255,0), 2)
+                cv2.putText(frame, f"C{cam_id} L{tid} {tr.score:.2f}", (x, max(0,y-7)), cv2.FONT_HERSHEY_PLAIN, 0.6, (255,255,0), 2)
+                
+            writer.write(frame)
+            
+    cap.release()
+    if writer is not None:
+        writer.release()
+        
+    detection: Dict[int, Detections] = {}
+    for lid, tr in tracker.tracks.items():
+        if not tr.frames:
+            continue
+        detection[lid] = Detections(cam_id=cam_id, local_id=lid, frames=tr.frames, boxes=tr.boxes, emb=tr.emb.copy() if tr.emb is not None else None)
+        
+    return Result(detection=detection, width=W, height=H, fps=fps)
+
+def stitch_globals(all_detections: Dict[int, Dict[int, Detections]]) -> Dict[Tuple[int,int], int]:
+    node_list = []
+    for cam_id, segs in all_detections.items():
+        for lid, seg in segs.items():
+            node_list.append((cam_id, lid, seg.start, seg.end, seg.emb))
+            
+    node_list.sort(key=lambda x: (x[2], x[3]))
+    
+    first: Dict[Tuple[int,int], Tuple[int,int]] = {}
+    def find(a: Tuple[int,int]) -> Tuple[int,int]:
+        first.setdefault(a, a)
+        if first[a] != a:
+            first[a] = find(first[a])
+        return first[a]
+    
+    def union(a: Tuple[int,int], b: Tuple[int,int]):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            first[rb] = ra
+            
+    for i in range(len(node_list)):
+        cam_i, lid_i, start_i, end_i, emb_i = node_list[i]
+        if emb_i is None:
+            continue
+        for j in range(i + 1, len(node_list)):
+            cam_j, lid_j, start_j, end_j, emb_j = node_list[j]
+            if cam_i == cam_j or emb_j is None:
+                continue
+            
+            if cosine_sim(emb_i, emb_j) >= thresh:
+                union((cam_i, lid_i), (cam_j, lid_j))
+                
+    gid_vect: Dict[Tuple[int,int], int] = {}
+    cluster_vect: Dict[Tuple[int,int], int] = {}
+    next_gid = 1
+    for cam_id, segs in all_detections.items():
+        for lid in segs.keys():
+            r = find((cam_id, lid))
+            if r not in cluster_vect:
+                cluster_vect[r] = next_gid
+                next_gid += 1
+            gid_vect[(cam_id, lid)] = cluster_vect[r]
+    return gid_vect
+
+def prediction(out_dir: str, all_detections: Dict[int, Dict[int, Detections]], gid_vect: Dict[Tuple[int,int], int]):
+    with open(out_dir, "w", newline="") as f:
+        w = csv.writer(f)
+        for cam_id in sorted(all_detections.keys()):
+            for lid, seg in all_detections[cam_id].items():
+                gid = gid_vect[(cam_id, lid)]
+                for fr, (x, y, bw, bh) in zip(seg.frames, seg.boxes):
+                    w.writerow([cam_id, gid, fr, x, y, bw, bh, -1, -1])
+                    
+def main():
+    
+    cams = cam_list(cam_list_file)
+    
+    #change value to enable drawing (slows execution)
+    draw_videos = False
+    
+    all_detections: Dict[int, Dict[int, Detections]] = {}
+    for cam_id, vid_path, meta in cams:
+        draw_path = (out_dir / f"cam{cam_id:03d}_detections.mp4") if draw_videos else None
+        print(f"[Cam {cam_id}]: {vid_path}")
+        cres = camera(cam_id=cam_id, vid_path=vid_path, model=model, conf=conf_val, imgsz=imgsz_val, iou_val=iou_val, max_miss=max_miss, draw=draw_videos, draw_path=draw_path)
+        all_detections[cam_id] = cres.detections
+        
+    gid_vect = stitch_globals(all_detections)
+    print("Stiching global IDs")
+    
+    path = os.path.join(cur_dir, prediction_file)
+    prediction(path, all_detections, gid_vect)
+    print(f"Predictions created. Located at {prediction_file}")
+    
+
 ###END FUNCTIONS
 
-###ORIG CODE BELOW
+if __name__ == "__main__":
+    main()
 
-name = model.names
-
-# load video
-cap = cv2.VideoCapture("../data/videos/trucks.mp4")
-
-#  set width and height
-frame_width = int(cap.get(3))
-frame_height = int(cap.get(4)) 
-size = (frame_width, frame_height)
-
-# create  Videowriter
-result = cv2.VideoWriter('../figures/track.mp4', cv2.VideoWriter_fourcc(*'mp4v'), 10, size)
-
-# init
-count = 0
-center_points_prev_frame = []
-tracking_objects = {}
-track_id = 0
-max_miss = 15
-misses = {}
-
-while True:
-    ret, frame = cap.read()
-    count += 1
-    if not ret:
-        break
-    
-    detections = model(frame, conf=0.35, imgsz=960)[0]
-    data = detections.boxes.data.cpu().numpy()
-
-    # init current frame points
-    center_points_cur_frame = []
-
-    # detect boxes
-    xyxy = data[:, :4].astype(int)
-    scores = data[:, 4]
-    class_ids = data[:, 5].astype(int)
-    boxes = [(x1, y1, x2 - x1, y2 - y1) for (x1, y1, x2, y2) in xyxy]
-
-    for i, box in enumerate(boxes):
-        (x, y, w, h) = box
-        cx = int((x + x + w)/ 2)
-        cy = int((y + y + h)/ 2)
-        center_points_cur_frame.append((cx, cy))
-        cv2.rectangle(frame, (x,y), (x + w, y + h), (0, 255, 0), 2)
-        class_info = f"{name[class_ids[i]]} {scores[i]:.2f}"
-        cv2.putText(frame, class_info, (x, y),
-                    cv2.FONT_HERSHEY_COMPLEX, 0.75, (250, 250, 0), 2)
-        
-    # first two frames
-    if count <= 2:
-        for pt in center_points_cur_frame:
-            for pt2 in center_points_prev_frame:
-                distance = math.hypot(pt2[0] -pt[0], pt2[1] - pt[1])
-
-                if distance < 45:
-                    tracking_objects[track_id] = pt
-                    misses[track_id] = 0
-                    track_id += 1
-    else:
-        tracking_objects_copy = tracking_objects.copy()
-        center_points_cur_frame_copy = center_points_cur_frame.copy()
-
-        for object_id, pt2 in tracking_objects_copy.items():
-            object_exists = False
-            for pt in center_points_cur_frame_copy: 
-                distance = math.hypot(pt2[0] - pt[0], pt2[1] - pt[1])
-
-                # Threshold
-                if distance < 45:
-                    if pt in center_points_cur_frame:
-                        center_points_cur_frame.remove(pt)
-                        tracking_objects[object_id] = pt
-                        object_exists = True
-                        misses[track_id] = 0
-                    continue
-
-            # remove id's that are lost
-            if not object_exists:
-                misses[object_id] = misses.get(object_id, 0) + 1
-                if misses[object_id] > max_miss:
-                    tracking_objects.pop(object_id, None)
-                    misses.pop(object_id, None)
-
-        # add new id's
-        for pt in center_points_cur_frame:
-            tracking_objects[track_id] = pt
-            misses[track_id] = 0
-            track_id += 1
-
-    # label boxes with ids
-    for object_id, pt in tracking_objects.items():
-        cv2.circle(frame, pt, 5, (0, 0, 5), -1)
-        cv2.putText(frame, str(object_id), (pt[0], pt[1] - 7), 0, 1, (0, 0, 255), 2)
-
-    # show frame
-    result.write(frame)
-    cv2.imshow("Frame", frame)
-
-    # copy cur to prev
-    # for first two frames
-    center_points_prev_frame = center_points_cur_frame.copy()
-
-    key = cv2.waitKey(1)
-    if key == 27:
-        break
-
-cap.release()
-cv2.destroyAllWindows()
