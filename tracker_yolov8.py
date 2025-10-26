@@ -2,6 +2,7 @@ import os, re, glob, cv2, math, csv
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass, field
+from collections import defaultdict
 from typing import List, Tuple, Dict, Optional
 from ultralytics import YOLO
 
@@ -15,11 +16,12 @@ imgsz_val = 960
 iou_val = 0.45
 cur_dir = os.getcwd()
 out_dir = "for_eval"
-prediction_file = "prediction.txt"
 cam_list_file = "list_cam.txt"
 thresh = 0.7
 max_miss = 15
 _CAM_RE = re.compile(r"(?:^|[\\/])c(\d{3})(?:[\\/]|$)", re.IGNORECASE)
+_DSTYPE_RE = re.compile(r"(?:^|[\\/])(train|validation|test)(?:[\\/]|$)", re.IGNORECASE)
+_SCENE_RE = re.compile(r"(?:^|[\\/])(S\d{2})(?:[\\/]|$)", re.IGNORECASE)
 
 ###END GLOBAL VARIABLES
 
@@ -131,7 +133,6 @@ class Result:
     height: int
     fps: float
 
-
 ###END CLASSES
 
 def xywh(a: Tuple[int,int,int,int], b: Tuple[int,int,int,int]) -> float:
@@ -168,14 +169,19 @@ def box_frame_bind(x:int, y:int, w:int, h:int, W:int, H:int) -> Tuple[int,int,in
 def cam_list(cam_list_file: str):
     cams = []
     with open(cam_list_file, "r") as f:
-        lines = [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
+        rows = [rw.strip() for rw in f if rw.strip()]
         
-    for cam_dir in lines:
-        cam_dir = os.path.normpath(cam_dir)
+    for cam_dir in rows:
+        cam_dir = os.path.abspath(os.path.normpath(cam_dir))
         #cam_dir = os.path.abspath(cam_dir)
         
         cam = _CAM_RE.search(cam_dir)
         cam_id = int(cam.group(1))
+        cam_str = f"c{cam_id:03d}"
+        dstype = _DSTYPE_RE.search(cam_dir)
+        dstype_id = dstype.group(1).lower()
+        scene = _SCENE_RE.search(cam_dir)
+        scene_id = scene.group(1).upper()
         
         vid_path = os.path.join(cam_dir, "vdo.avi")
         roi_path = os.path.join(cam_dir, "roi.jpg")
@@ -187,6 +193,10 @@ def cam_list(cam_list_file: str):
         
         meta = {
             "cam_dir": cam_dir,
+            "cam_id": cam_id,
+            "cam_str": cam_str,
+            "dstype": dstype_id,
+            "scene": scene_id,
             "roi": roi_path,
             "gt": gt_path,
             "det_dir": det_dir,
@@ -275,24 +285,24 @@ def camera(cam_id: int, vid_path: str, model: YOLO, conf: float, imgsz: int, iou
             continue
         detection[lid] = Detections(cam_id=cam_id, local_id=lid, frames=tr.frames, boxes=tr.boxes, emb=tr.emb.copy() if tr.emb is not None else None)
         
-    return Result(detection=detection, width=W, height=H, fps=fps)
+    return Result(detections=detection, width=W, height=H, fps=fps)
 
-def stitch_globals(all_detections: Dict[int, Dict[int, Detections]]) -> Dict[Tuple[int,int], int]:
+def stitch_globals(all_detections, scene_mapper, thresh: float):
     node_list = []
-    for cam_id, segs in all_detections.items():
-        for lid, seg in segs.items():
-            node_list.append((cam_id, lid, seg.start, seg.end, seg.emb))
+    for cam_id, detections in all_detections.items():
+        for lid, detection in detections.items():
+            node_list.append((cam_id, lid, detection.start, detection.end, detection.emb))
             
     node_list.sort(key=lambda x: (x[2], x[3]))
     
-    first: Dict[Tuple[int,int], Tuple[int,int]] = {}
-    def find(a: Tuple[int,int]) -> Tuple[int,int]:
+    first = {}
+    def find(a):
         first.setdefault(a, a)
         if first[a] != a:
             first[a] = find(first[a])
         return first[a]
     
-    def union(a: Tuple[int,int], b: Tuple[int,int]):
+    def union(a, b):
         ra, rb = find(a), find(b)
         if ra != rb:
             first[rb] = ra
@@ -303,17 +313,15 @@ def stitch_globals(all_detections: Dict[int, Dict[int, Detections]]) -> Dict[Tup
             continue
         for j in range(i + 1, len(node_list)):
             cam_j, lid_j, start_j, end_j, emb_j = node_list[j]
-            if cam_i == cam_j or emb_j is None:
+            if cam_i == cam_j or emb_j is None or scene_mapper.get(cam_i) != scene_mapper.get(cam_j):
                 continue
             
             if cosine_sim(emb_i, emb_j) >= thresh:
                 union((cam_i, lid_i), (cam_j, lid_j))
                 
-    gid_vect: Dict[Tuple[int,int], int] = {}
-    cluster_vect: Dict[Tuple[int,int], int] = {}
-    next_gid = 1
-    for cam_id, segs in all_detections.items():
-        for lid in segs.keys():
+    gid_vect, cluster_vect, next_gid = {}, {}, 1
+    for cam_id, detections in all_detections.items():
+        for lid in detections.keys():
             r = find((cam_id, lid))
             if r not in cluster_vect:
                 cluster_vect[r] = next_gid
@@ -330,27 +338,61 @@ def prediction(out_dir: str, all_detections: Dict[int, Dict[int, Detections]], g
                 for fr, (x, y, bw, bh) in zip(seg.frames, seg.boxes):
                     w.writerow([cam_id, gid, fr, x, y, bw, bh, -1, -1])
                     
+def gt_compiler(cam_list_by_dstype, dstype_gt_file: str):
+     with open(dstype_gt_file, "w", newline="") as out_f:
+        w = csv.writer(out_f)
+        for cam_id, vid_path, meta in cam_list_by_dstype:
+            check = meta.get("dstype")
+            if check != "test":
+                gt_path = meta.get("gt")
+            else: continue
+            with open(gt_path) as g:
+                for rw in g:
+                    s = rw.strip()
+                    parts = re.split(r"[,]+", s)
+                    fid = int(float(parts[0]))
+                    gid = int(float(parts[1]))
+                    x   = int(float(parts[2]))
+                    y   = int(float(parts[3]))
+                    w_  = int(float(parts[4]))
+                    h_  = int(float(parts[5]))
+                    w.writerow([cam_id, gid, fid, x, y, w_, h_, -1, -1])
+                        
+def group_by_dstype(cams):
+    group_list = defaultdict(list)
+    for cam_id, vid_path, meta in cams:
+        dstype = meta.get("dstype")
+        group_list[dstype].append((cam_id, vid_path, meta))
+    return group_list
+                    
 def main():
     
     cams = cam_list(cam_list_file)
+    cam_groups = group_by_dstype(cams)
     
     #change value to enable drawing (slows execution)
     draw_videos = False
     
-    all_detections: Dict[int, Dict[int, Detections]] = {}
-    for cam_id, vid_path, meta in cams:
-        draw_path = (out_dir / f"cam{cam_id:03d}_detections.mp4") if draw_videos else None
-        print(f"[Cam {cam_id}]: {vid_path}")
-        cres = camera(cam_id=cam_id, vid_path=vid_path, model=model, conf=conf_val, imgsz=imgsz_val, iou_val=iou_val, max_miss=max_miss, draw=draw_videos, draw_path=draw_path)
-        all_detections[cam_id] = cres.detections
+    for dstype, cam_group in cam_groups.items():
+        prediction_file = os.path.join(out_dir, f"{dstype}_prediction.txt")
+        dstype_gt_file = os.path.join(out_dir, f"{dstype}_gt.txt")   
+    
+        all_detections: Dict[int, Dict[int, Detections]] = {}
+        scene_mapping = {cam_id: meta.get("scene") for cam_id, _, meta in cam_group}
         
-    gid_vect = stitch_globals(all_detections)
-    print("Stiching global IDs")
+        for cam_id, vid_path, meta in cam_group:
+            draw_path = os.path.join(out_dir, f"{dstype}_cam{cam_id:03d}_detections.mp4") if draw_videos else None
+        
+            cres = camera(cam_id=cam_id, vid_path=vid_path, model=model, conf=conf_val, imgsz=imgsz_val, iou_val=iou_val, max_miss=max_miss, draw=draw_videos, draw_path=draw_path)
+            all_detections[cam_id] = cres.detections
+
+        gid_vect = stitch_globals(all_detections, scene_mapping, thresh)
     
-    path = os.path.join(cur_dir, prediction_file)
-    prediction(path, all_detections, gid_vect)
-    print(f"Predictions created. Located at {prediction_file}")
+        #path = os.path.join(out_dir, prediction_file)
+        prediction(prediction_file, all_detections, gid_vect)
     
+        if dstype != "test":
+            gt_compiler(cam_group, dstype_gt_file)    
 
 ###END FUNCTIONS
 
