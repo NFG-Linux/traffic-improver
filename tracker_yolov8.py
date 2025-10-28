@@ -17,8 +17,17 @@ iou_val = 0.45
 cur_dir = os.getcwd()
 out_dir = "for_eval"
 cam_list_file = "list_cam.txt"
+eval_dir = os.path.join(cur_dir, "eval")
+train_gt_file = os.path.join(eval_dir, "ground_truth_train.txt")
+val_gt_file = os.path.join(eval_dir, "ground_truth_validation.txt")
+framenum_dir = os.path.join(cur_dir, "cam_framenum")
+loc_dir = os.path.join(cur_dir, "cam_loc")
+timestamp_dir = os.path.join(cur_dir, "cam_timestamp")
 thresh = 0.7
 max_miss = 15
+e_mu = None
+e_p = None
+vehicle_cls = {1, 2, 3, 5, 7}
 _CAM_RE = re.compile(r"(?:^|[\\/])c(\d{3})(?:[\\/]|$)", re.IGNORECASE)
 _DSTYPE_RE = re.compile(r"(?:^|[\\/])(train|validation|test)(?:[\\/]|$)", re.IGNORECASE)
 _SCENE_RE = re.compile(r"(?:^|[\\/])(S\d{2})(?:[\\/]|$)", re.IGNORECASE)
@@ -46,12 +55,13 @@ class Track:
         self.frames.append(frame1)
         self.boxes.append(box)
         if patch is not None:
-            feat = embed_hsv(patch)
-            if feat is not None:
+            feature = embed_reid(patch)
+            if feature is not None:
+                feature = apply_whitener(feature)
                 if self.emb is None:
-                    self.emb = feat
+                    self.emb = feature
                 else:
-                    self.emb = (1 - alpha) * self.emb + alpha * feat
+                    self.emb = (1 - alpha) * self.emb + alpha * feature
                     
 @dataclass
 class Detections:
@@ -81,6 +91,7 @@ class TrackIoU:
         self.max_miss = max_miss
         self.next_id = 1
         self.tracks: Dict[int, Track] = {}
+        self.gone: Dict[int, Track] = {}
         
     def step(self, frame1: int, frame_img: np.ndarray, dets: List[Tuple[Tuple[int,int,int,int], float, int]]) -> Dict[int, Track]:
         notmatched = set(self.tracks.keys())
@@ -122,9 +133,15 @@ class TrackIoU:
             if tr.misses > self.max_miss:
                 del_list.append(tid)
         for tid in del_list:
+            self.gone[tid] = self.tracks[tid]
             del self.tracks[tid]
             
         return self.tracks
+    
+    def finish(self):
+        for tid, tr in list(self.tracks.items()):
+            self.gone[tid] = tr
+        self.tracks.clear()
     
 @dataclass
 class Result:
@@ -152,6 +169,8 @@ def xywh(a: Tuple[int,int,int,int], b: Tuple[int,int,int,int]) -> float:
 def cosine_sim(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> float:
     if a is None or b is None:
         return -1.0
+    a = np.asarray(a, dtype=np.float32).ravel()
+    b = np.asarray(b, dtype=np.float32).ravel()
     na = np.linalg.norm(a)
     nb = np.linalg.norm(b)
     if na == 0 or nb == 0:
@@ -172,8 +191,7 @@ def cam_list(cam_list_file: str):
         rows = [rw.strip() for rw in f if rw.strip()]
         
     for cam_dir in rows:
-        cam_dir = os.path.abspath(os.path.normpath(cam_dir))
-        #cam_dir = os.path.abspath(cam_dir)
+        cam_dir = os.path.abspath(cam_dir)
         
         cam = _CAM_RE.search(cam_dir)
         cam_id = int(cam.group(1))
@@ -209,6 +227,82 @@ def cam_list(cam_list_file: str):
 
     return cams
 
+def parse_gt(cam_mapper, gt_file, max_per_id=40):
+    rows_by_cam = defaultdict(lambda: defaultdict(list))
+    with open(gt_file, "r", newline="") as f:
+        for lineno, rw in enumerate(f, 1):
+            s = rw.strip()
+            if not s:
+                continue
+            parts = re.split(r"[\s]+", s)
+            cam_id = int(parts[0])
+            gid = int(parts[1])
+            fid = int(parts[2])
+            x = int(float(parts[3]))
+            y = int(float(parts[4]))
+            w = int(float(parts[5]))
+            h = int(float(parts[6]))
+            rows_by_cam[cam_id][fid].append((gid, x, y, w, h))
+
+    X_list = []# features
+    y_list = []# GID
+    count_per_id = defaultdict(int)
+
+    for cam_id, frames in rows_by_cam.items():
+        if cam_id not in cam_mapper: 
+            continue
+        cap = cv2.VideoCapture(cam_mapper[cam_id]["vdo"])
+        cur = -1
+        for fid in sorted(frames.keys()):
+            while cur < fid - 1:
+                ret = cap.read()[0]
+                if not ret: break
+                cur += 1
+            ret, frame = cap.read()
+            if not ret: break
+            cur += 1
+            for gid, x0, y0, w0, h0 in frames[fid]:
+                if count_per_id[gid] >= max_per_id:
+                    continue
+                x2, y2 = max(0, x0), max(0, y0)
+                crop = frame[y2:y2+h0, x2:x2+w0]
+                f = embed_reid(crop)
+                if f is None: 
+                    continue
+                X_list.append(f)
+                y_list.append(gid)
+                count_per_id[gid] += 1
+        cap.release()
+
+    X = np.asarray(X_list, dtype=np.float32)
+    y = np.asarray(y_list, dtype=np.int32)
+    return X, y
+
+def whitener(X, out_dim=128):
+    mu = X.mean(axis=0, keepdims=False)
+    Xc = X - mu
+    C = (Xc.T @ Xc) / max(1, Xc.shape[0]-1)
+    eigvals, eigvecs = np.linalg.eigh(C)
+    idx = np.argsort(eigvals)[::-1]
+    eigvals, eigvecs = eigvals[idx], eigvecs[:, idx]
+    keep = min(out_dim, eigvecs.shape[1])
+    P = eigvecs[:, :keep] @ np.diag(1.0 / np.sqrt(eigvals[:keep] + 1e-8))
+    return mu.astype(np.float32), P.astype(np.float32)
+
+def load_whitener(path: str):
+    global e_mu, e_p
+    if os.path.exists(path):
+        z = np.load(path)
+        e_mu = z["mu"].astype(np.float32).ravel()
+        e_p = z["P"].astype(np.float32)
+        
+def apply_whitener(feature: np.ndarray) -> np.ndarray:
+    if e_mu is None or e_p is None:
+        return feature.astype(np.float32).ravel()
+    f = (feature.astype(np.float32).ravel() - e_mu) @ e_p
+    f = f / (np.linalg.norm(f) + 1e-9)
+    return f.astype(np.float32)
+
 def crop(frame: np.ndarray, box: Tuple[int,int,int,int]) -> np.ndarray:
     h, w = frame.shape[:2]
     x, y, bw, bh = box
@@ -219,17 +313,31 @@ def crop(frame: np.ndarray, box: Tuple[int,int,int,int]) -> np.ndarray:
         return None
     return frame[y:y2, x:x2]
 
-def embed_hsv(img: np.ndarray) -> Optional[np.ndarray]:
+def embed_reid(img: np.ndarray) -> Optional[np.ndarray]:
     if img is None or img.size == 0:
         return None
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     h_bins, s_bins, v_bins = 16, 16, 8
-    vect = cv2.calcHist([hsv], [0,1,2], None, [h_bins, s_bins, v_bins], [0,180, 0,256, 0,256])
-    vect = cv2.normalize(vect, None).flatten().astype(np.float32)
-    return vect
+    chist = cv2.calcHist([hsv], [0,1,2], None, [h_bins, s_bins, v_bins], [0,180, 0,256, 0,256]).astype(np.float32)
+    chist = cv2.normalize(chist, None).flatten()
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.magnitude(gx, gy)
+    
+    m = np.percentile(mag, 99.5)
+    if m > 0:
+        mag = np.clip(mag, 0, m) / m
+    ghist = cv2.calcHist([mag], [0], None, [32], [0, 1]).astype(np.float32).flatten()
+    ghist = cv2.normalize(ghist, None).flatten()
+    
+    feature = np.concatenate([chist, ghist], axis=0)
+    feature = np.sign(feature) * np.sqrt(np.abs(feature))
+    normal = np.linalg.norm(feature) + 1e-9
+    return (feature / normal).astype(np.float32)
 
 def camera(cam_id: int, vid_path: str, model: YOLO, conf: float, imgsz: int, iou_val: float, max_miss: int, draw: bool,
-           draw_path: Optional[str]) -> Result:
+           draw_path: Optional[str], roi_mask: np.ndarray) -> Result:
     cap = cv2.VideoCapture(vid_path)
     
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
@@ -259,8 +367,22 @@ def camera(cam_id: int, vid_path: str, model: YOLO, conf: float, imgsz: int, iou
             scores = data[:, 4]
             cls_ids = data[:, 5].astype(int)
             for (x1, y1, x2, y2), sc, cid in zip(xyxy, scores, cls_ids):
+                if cid not in vehicle_cls:
+                    continue
                 x = int(x1); y = int(y1); w = int(x2 - x1); h = int(y2 - y1)
                 x, y, w, h = box_frame_bind(x, y, w, h, W, H)
+                #ROI
+                cx, cy = x + w // 2, y + h // 2
+                if roi_mask[min(max(cy, 0), roi_mask.shape[0]-1), min(max(cx, 0), roi_mask.shape[1]-1)] == 0:
+                    continue
+                #need to edit to tune, per camera bounds
+                area = w * h
+                ar = w / float(h + 1e-6)
+                if not (100 <= area <= 0.25 * W * H):
+                    continue
+                if not (0.2 <= ar <= 4.0):
+                    continue
+                
                 dets.append(((x, y, w, h), float(sc), int(cid)))
                 
         tracks = tracker.step(frame1, frame, dets)
@@ -279,8 +401,10 @@ def camera(cam_id: int, vid_path: str, model: YOLO, conf: float, imgsz: int, iou
     if writer is not None:
         writer.release()
         
+    tracker.finish()
+        
     detection: Dict[int, Detections] = {}
-    for lid, tr in tracker.tracks.items():
+    for lid, tr in tracker.gone.items():
         if not tr.frames:
             continue
         detection[lid] = Detections(cam_id=cam_id, local_id=lid, frames=tr.frames, boxes=tr.boxes, emb=tr.emb.copy() if tr.emb is not None else None)
@@ -338,33 +462,92 @@ def prediction(out_dir: str, all_detections: Dict[int, Dict[int, Detections]], g
                 for fr, (x, y, bw, bh) in zip(seg.frames, seg.boxes):
                     w.writerow([cam_id, gid, fr, x, y, bw, bh, -1, -1])
                     
-def gt_compiler(cam_list_by_dstype, dstype_gt_file: str):
-     with open(dstype_gt_file, "w", newline="") as out_f:
-        w = csv.writer(out_f)
-        for cam_id, vid_path, meta in cam_list_by_dstype:
-            check = meta.get("dstype")
-            if check != "test":
-                gt_path = meta.get("gt")
-            else: continue
-            with open(gt_path) as g:
-                for rw in g:
-                    s = rw.strip()
-                    parts = re.split(r"[,]+", s)
-                    fid = int(float(parts[0]))
-                    gid = int(float(parts[1]))
-                    x   = int(float(parts[2]))
-                    y   = int(float(parts[3]))
-                    w_  = int(float(parts[4]))
-                    h_  = int(float(parts[5]))
-                    w.writerow([cam_id, gid, fid, x, y, w_, h_, -1, -1])
-                        
 def group_by_dstype(cams):
     group_list = defaultdict(list)
     for cam_id, vid_path, meta in cams:
         dstype = meta.get("dstype")
         group_list[dstype].append((cam_id, vid_path, meta))
     return group_list
-                    
+
+def load_framenum(framenum_file: str) -> dict[int, int]:
+    out = {}
+    with open(framenum_file) as f:
+        for rw in f:
+            s = rw.strip()
+            parts = re.split(r"[\s]+", s)
+            cam_str = parts[0].lower()
+            out[int(cam_str[1:])] = int(float(parts[1]))
+    return out
+
+def load_offsets(scene_file: str) -> dict[int, float]:
+    off = {}
+    with open(scene_file) as f:
+        for rw in f:
+            s = rw.strip()
+            parts = re.split(r"[\s]+", s)
+            cam_str = parts[0].lower()
+            cam_id = int(cam_str[1:])
+            off[cam_id] = float(parts[1])
+    return off
+
+def cam_time(frame_id: int, fps: float, cam_id: int, scene_id: str, scene_offset: dict[str, dict[int,float]]) -> float | None:
+    scene_mapper = scene_offset.get(scene_id, {})
+    return scene_mapper[cam_id] + (frame_id - 1) / float(fps)
+
+def load_calibration(calib_path: str) -> Tuple[np.ndarray, float, Optional[np.ndarray], Optional[np.ndarray]]:
+    H = None
+    err = None
+    I = None
+    dist = None
+    with open(calib_path) as f:
+        for rw in f:
+            s = rw.strip()
+            if s.lower().startswith("homography"):
+                hmatrix_str = s.split(":", 1)[1].strip()
+                rows = [r.strip() for r in hmatrix_str.split(";") if r.strip()]
+                data = []
+                for r in rows:
+                    nums = [float(x) for x in re.split(r"[,\s]+", r) if x]
+                    data.append(nums)
+                H = np.array(data, dtype=np.float64).reshape(3,3)
+            elif s.lower().startswith("reprojection"):
+                val = s.split(":",1)[1].strip()
+                err = float(val)
+            elif s.lower().startswith("intrinsic"):
+                imatrix_str = s.split(":", 1)[1].strip()
+                rows = [r.strip() for r in imatrix_str.split(";") if r.strip()]
+                data = []
+                for r in rows:
+                    nums = [float(x) for x in re.split(r"[,\s]+", r) if x]
+                    data.append(nums)
+                if not data:
+                    I = None
+                else: I = np.array(data, dtype=np.float64).reshape(3,3)
+            elif s.lower().startswith("distortion"):
+                dist_str = s.split(":", 1)[1].strip()
+                nums = [float(x) for x in re.split(r"[\s]+", dist_str.strip()) if x]
+                if not nums:
+                    dist = None
+                else: dist = np.array(nums, dtype=np.float64)
+                                
+    return H, err, I, dist
+
+def undistort_world(x: float, y: float, I: Optional[np.ndarray], dist: Optional[np.ndarray]) -> Tuple[float, float]:
+    if I is None or dist is None:
+        return x, y
+    
+    coords = np.array([[[x, y]]], dtype=np.float64)
+    fixed = cv2.undistortPoints(coords, I, dist, P=I)
+    return float(fixed[0,0,0]), float(fixed[0,0,1])
+
+def assign_world(H: np.ndarray, x: float, y: float, I: Optional[np.ndarray] = None, dist: Optional[np.ndarray] = None) -> Tuple[float,float]:
+    xu, yu = undistort_world(x, y, I, dist)
+    v = np.array([xu, yu, 1.0], dtype=np.float64)
+    w = H @ v
+    if abs(w[2]) < 1e-9:
+        return (-1.0, -1.0)
+    return (float(w[0]/w[2]), float(w[1]/w[2]))
+
 def main():
     
     cams = cam_list(cam_list_file)
@@ -375,24 +558,65 @@ def main():
     
     for dstype, cam_group in cam_groups.items():
         prediction_file = os.path.join(out_dir, f"{dstype}_prediction.txt")
-        dstype_gt_file = os.path.join(out_dir, f"{dstype}_gt.txt")   
+        whitener_file = os.path.join(out_dir, f"{dstype}_whitener.npz")
+        cam_mapping = {cam_id: {"vdo": vid_path} for cam_id, vid_path, _ in cam_group}
+        if dstype != "test":
+            dstype_gt_file = os.path.join(eval_dir, f"ground_truth_{dstype}.txt")
+            if not os.path.exists(whitener_file):
+                X, y = parse_gt(cam_mapping, dstype_gt_file, max_per_id=40)
+                if X.size:
+                    mu, P = whitener(X, out_dim=128)
+                    np.savez(whitener_file, mu=mu, P=P)
+            load_whitener(whitener_file)
+        else:
+            load_whitener(os.path.join(out_dir, "validation_whitener.npz"))
+            
+            #need to reload since the above creates the file; test uses out of loop instance
+            load_whitener(whitener_file)       
     
         all_detections: Dict[int, Dict[int, Detections]] = {}
-        scene_mapping = {cam_id: meta.get("scene") for cam_id, _, meta in cam_group}
+        
+        scene_mapping: Dict[int, str] = {cam_id: meta.get("scene") for cam_id, _, meta in cam_group}
+        offsets_cache: Dict[str, Dict[int, float]] = {}
+        frame_nums_cache: Dict[str, Dict[int, int]] = {}
+
+        fps_dict: Dict[int, float] = {}
+        
+        cam_calib = {}
+        for cam_id, _, meta in cam_group:
+            H, err, I, dist = load_calibration(meta.get("calibration"))
+            cam_calib[cam_id] = (H, err, I, dist)
+            scene = meta["scene"]
+            m = re.search(r"\d+", str(scene))
+            scene_stem = f"S{int(m.group(0)):02d}"
+            if scene_stem not in offsets_cache:
+                offsets_cache[scene_stem] = load_offsets(os.path.join(timestamp_dir, f"{scene_stem}.txt"))
+            if scene_stem not in frame_nums_cache:
+                frame_nums_cache[scene_stem] = load_framenum(os.path.join(framenum_dir, f"{scene_stem}.txt"))
         
         for cam_id, vid_path, meta in cam_group:
             draw_path = os.path.join(out_dir, f"{dstype}_cam{cam_id:03d}_detections.mp4") if draw_videos else None
+            
+            scene = meta["scene"]
+            scene_stem = f"S{int(re.search(r'\d+', str(scene)).group(0)):02d}"
+           
+            offsets = offsets_cache[scene_stem]
+            frame_nums  = frame_nums_cache[scene_stem]
+            
+            roi_mask = cv2.imread(meta["roi"], cv2.IMREAD_GRAYSCALE)
+            roi_mask = (roi_mask > 0).astype(np.uint8)
         
-            cres = camera(cam_id=cam_id, vid_path=vid_path, model=model, conf=conf_val, imgsz=imgsz_val, iou_val=iou_val, max_miss=max_miss, draw=draw_videos, draw_path=draw_path)
+            cres = camera(cam_id=cam_id, vid_path=vid_path, model=model, conf=conf_val, imgsz=imgsz_val, iou_val=iou_val, max_miss=max_miss, draw=draw_videos, draw_path=draw_path, roi_mask=roi_mask)
             all_detections[cam_id] = cres.detections
+            fps_dict[cam_id] = float(cres.fps) if cres.fps else None
+            
+            expected_frames = frame_nums.get(meta.get("scene"), {}).get(cam_id)
+            if expected_frames and draw_videos is False:
+                pass
 
         gid_vect = stitch_globals(all_detections, scene_mapping, thresh)
     
-        #path = os.path.join(out_dir, prediction_file)
-        prediction(prediction_file, all_detections, gid_vect)
-    
-        if dstype != "test":
-            gt_compiler(cam_group, dstype_gt_file)    
+        prediction(prediction_file, all_detections, gid_vect)   
 
 ###END FUNCTIONS
 
